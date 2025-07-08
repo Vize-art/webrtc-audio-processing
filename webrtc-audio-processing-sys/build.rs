@@ -1,229 +1,174 @@
-use anyhow::Result;
-use std::{env, path::PathBuf};
+use anyhow::{Context, Result};
+use std::{env, path::PathBuf, process::Command};
 
-const DEPLOYMENT_TARGET_VAR: &str = "MACOSX_DEPLOYMENT_TARGET";
+fn build_webrtc_for_android() -> Result<()> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let webrtc_source_dir = manifest_dir.join("webrtc-audio-processing");
 
-fn out_dir() -> PathBuf {
-    std::env::var("OUT_DIR").expect("OUT_DIR environment var not set.").into()
-}
+    let android_ndk_home = env::var("ANDROID_NDK_HOME")
+        .context("ANDROID_NDK_HOME must be set, either in your environment or a .env file.")?;
 
-fn src_dir() -> PathBuf {
-    std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR environment var not set.").into()
-}
+    let toolchains_path =
+        PathBuf::from(&android_ndk_home).join("toolchains/llvm/prebuilt/linux-x86_64");
+    let bin_path = toolchains_path.join("bin");
 
-#[cfg(not(feature = "bundled"))]
-mod webrtc {
-    use super::*;
-    use anyhow::{bail, Result};
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let api_level = "21";
+    let target_triple = format!("{}-linux-android", target_arch);
+    let full_target_triple = format!("{}{}", target_triple, api_level);
 
-    const LIB_NAME: &str = "webrtc-audio-processing-2";
-    const LIB_MIN_VERSION: &str = "2.0";
+    let cc_path = bin_path.join(format!("{}-clang", full_target_triple));
+    let cxx_path = bin_path.join(format!("{}-clang++", full_target_triple));
+    let ar_path = bin_path.join("llvm-ar");
 
-    pub(super) fn get_build_paths() -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-        let (pkgconfig_include_path, pkgconfig_lib_path) = find_pkgconfig_paths()?;
+    let cross_file_path = out_dir.join("cross_file.txt");
+    let cross_file_content = format!(
+        r#"[binaries]
+        c = '{}'
+        cpp = '{}'
+        ar = '{}'
 
-        let include_path = std::env::var("WEBRTC_AUDIO_PROCESSING_INCLUDE")
-            .ok()
-            .map(PathBuf::from)
-            .or(pkgconfig_include_path);
-        let lib_path = std::env::var("WEBRTC_AUDIO_PROCESSING_LIB")
-            .ok()
-            .map(PathBuf::from)
-            .or(pkgconfig_lib_path);
+        [host_machine]
+        system = '{}'
+        cpu_family = '{}'
+        cpu = '{}'
+        endian = 'little'"#,
+        cc_path.to_str().unwrap(),
+        cxx_path.to_str().unwrap(),
+        ar_path.to_str().unwrap(),
+        target_os,
+        target_arch,
+        target_arch,
+    );
+    std::fs::write(&cross_file_path, &cross_file_content)
+        .context("Failed to write Meson cross file")?;
 
-        if include_path.is_none() || lib_path.is_none() {
-            bail!(
-                "Couldn't find {}. Please install it or set WEBRTC_AUDIO_PROCESSING_INCLUDE and WEBRTC_AUDIO_PROCESSING_LIB environment variables.",
-                LIB_NAME
-            );
-        }
+    let webrtc_build_dir = out_dir.join("webrtc-audio-processing");
+    let meson_setup = Command::new("meson")
+        .arg("setup")
+        .arg("--prefix")
+        .arg(&out_dir)
+        .arg("-Ddefault_library=static")
+        .arg("--cross-file")
+        .arg(&cross_file_path)
+        .arg(&webrtc_source_dir)
+        .arg(&webrtc_build_dir)
+        .arg("--wipe")
+        .status()
+        .context("Failed to execute meson. Do you have it installed?")?;
+    assert!(meson_setup.success(), "Meson setup command failed.");
 
-        Ok((vec![include_path.unwrap()], vec![lib_path.unwrap()]))
-    }
+    let ninja_build = Command::new("ninja")
+        .current_dir(&webrtc_build_dir)
+        .status()
+        .context("Failed to execute ninja. Do you have it installed?")?;
+    assert!(ninja_build.success(), "Ninja build command failed.");
 
-    pub(super) fn build_if_necessary() -> Result<()> {
-        Ok(())
-    }
+    let ninja_install = Command::new("ninja")
+        .current_dir(&webrtc_build_dir)
+        .arg("install")
+        .status()
+        .context("Failed to execute ninja install")?;
+    assert!(ninja_install.success(), "Ninja install command failed.");
 
-    fn find_pkgconfig_paths() -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-        let lib = match pkg_config::Config::new()
-            .atleast_version(LIB_MIN_VERSION)
-            .statik(false)
-            .probe(LIB_NAME)
-        {
-            Ok(lib) => lib,
-            Err(e) => {
-                eprintln!("Couldn't find {LIB_NAME} with pkg-config:");
-                eprintln!("{e}");
-                return Ok((None, None));
-            },
-        };
-
-        Ok((lib.include_paths.first().cloned(), lib.link_paths.first().cloned()))
-    }
-}
-
-#[cfg(feature = "bundled")]
-mod webrtc {
-    use super::*;
-    use anyhow::{bail, Context, Result};
-    use std::{path::Path, process::Command};
-
-    const BUNDLED_SOURCE_PATH: &str = "./webrtc-audio-processing";
-
-    pub(super) fn get_build_paths() -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-        let mut include_paths = vec![
-            out_dir().join("include"),
-            out_dir().join("include").join("webrtc-audio-processing-2"),
-            src_dir().join("webrtc-audio-processing"),
-            src_dir().join("webrtc-audio-processing").join("webrtc"),
-        ];
-        let mut lib_paths = vec![out_dir().join("lib")];
-
-        if let Ok(mut lib) =
-            pkg_config::Config::new().atleast_version("20240722").probe("absl_base")
-        {
-            // If abseil package is installed locally, meson would have linked it for
-            // webrtc-audio-processing-2. Use the same library for our wrapper, too.
-            include_paths.append(&mut lib.include_paths);
-            lib_paths.append(&mut lib.link_paths);
-        } else {
-            // Otherwise use the local build fetched and built by meson.
-            include_paths.push(
-                src_dir()
-                    .join("webrtc-audio-processing")
-                    .join("subprojects")
-                    .join("abseil-cpp-20240722.0"),
-            );
-            lib_paths.push(
-                out_dir()
-                    .join("webrtc-audio-processing")
-                    .join("subprojects")
-                    .join("abseil-cpp-20240722.0"),
-            );
-        }
-
-        Ok((include_paths, lib_paths))
-    }
-
-    pub(super) fn build_if_necessary() -> Result<()> {
-        if Path::new(BUNDLED_SOURCE_PATH).read_dir()?.next().is_none() {
-            eprintln!("The webrtc-audio-processing source directory is empty.");
-            eprintln!("See the crate README for installation instructions.");
-            eprintln!("Remember to clone the repo recursively if building from source.");
-            bail!("Aborting compilation because bundled source directory is empty.");
-        }
-
-        let build_dir = out_dir();
-        let install_dir = out_dir();
-
-        let webrtc_build_dir = build_dir.join(BUNDLED_SOURCE_PATH);
-        let mut meson = Command::new("meson");
-        let status = meson
-            .args(&["setup", "--prefix", install_dir.to_str().unwrap()])
-            .arg("-Ddefault_library=static")
-            .arg(BUNDLED_SOURCE_PATH)
-            .arg(webrtc_build_dir.to_str().unwrap())
-            .status()
-            .context("Failed to execute meson. Do you have it installed?")?;
-        assert!(status.success(), "Command failed: {:?}", &meson);
-
-        let mut ninja = Command::new("ninja");
-        let status = ninja
-            .current_dir(&webrtc_build_dir)
-            .status()
-            .context("Failed to execute ninja. Do you have it installed?")?;
-        assert!(status.success(), "Command failed: {:?}", &ninja);
-
-        let mut install = Command::new("ninja");
-        let status = install
-            .current_dir(&webrtc_build_dir)
-            .arg("install")
-            .status()
-            .context("Failed to execute ninja install")?;
-        assert!(status.success(), "Command failed: {:?}", &install);
-
-        Ok(())
-    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    webrtc::build_if_necessary()?;
-    let (include_dirs, lib_dirs) = webrtc::get_build_paths()?;
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    if target_os == "android" {
+        // dotenvy::dotenv().ok();
+        build_webrtc_for_android()?;
+    }
+
+    let webrtc_source_root = manifest_dir.join("webrtc-audio-processing");
+    let include_dirs = vec![
+        out_dir.join("include"),
+        webrtc_source_root.clone(),
+        webrtc_source_root.join("webrtc"),
+    ];
+    let mut lib_dirs = vec![out_dir.join("lib")];
+
+    // --- Start of fix ---
+    // The Abseil libraries are built by Meson into a subdirectory. We need to find
+    // that directory and add it to the linker search path.
+    if target_os == "android" {
+        let abseil_lib_dir =
+            out_dir.join("webrtc-audio-processing/subprojects/abseil-cpp-20240722.0");
+        lib_dirs.push(abseil_lib_dir);
+    }
+    // --- End of fix ---
 
     for dir in &lib_dirs {
-        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-search=native={}", dir.to_str().unwrap());
     }
 
-    if cfg!(feature = "bundled") {
-        println!("cargo:rustc-link-lib=static=webrtc-audio-processing-2");
-        println!("cargo:rustc-link-lib=absl_strings");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=webrtc-audio-processing-2");
+    println!("cargo:rustc-link-lib=static=webrtc-audio-processing-2");
+    // --- Start of fix ---
+    // Link all the necessary Abseil libraries.
+    println!("cargo:rustc-link-lib=static=absl_strings");
+    println!("cargo:rustc-link-lib=static=absl_base");
+    println!("cargo:rustc-link-lib=static=absl_flags");
+    // --- End of fix ---
+
+    if target_os == "android" {
+        println!("cargo:rustc-link-lib=c++_shared");
     }
 
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    }
-
-    let mut cc_build = cc::Build::new();
-
-    // set mac minimum version
-    if cfg!(target_os = "macos") {
-        let min_version = match env::var(DEPLOYMENT_TARGET_VAR) {
-            Ok(ver) => ver,
-            Err(_) => {
-                String::from(match std::env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
-                    "x86_64" => "10.10", // Using what I found here https://github.com/webrtc-uwp/chromium-build/blob/master/config/mac/mac_sdk.gni#L17
-                    "aarch64" => "11.0", // Apple silicon started here.
-                    arch => panic!("unknown arch: {}", arch),
-                })
-            },
-        };
-
-        // `cc` doesn't try to pick up on this automatically, but `clang` needs it to
-        // generate a "correct" Objective-C symbol table which better matches XCode.
-        // See https://github.com/h4llow3En/mac-notification-sys/issues/45.
-        cc_build.flag(&format!("-mmacos-version-min={}", min_version));
-    }
-
-    cc_build
+    cc::Build::new()
         .cpp(true)
         .file("src/wrapper.cpp")
         .includes(&include_dirs)
         .flag("-std=c++17")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-deprecated-declarations")
-        .out_dir(&out_dir())
+        .out_dir(&out_dir)
         .compile("webrtc_audio_processing_wrapper");
 
     println!("cargo:rustc-link-lib=static=webrtc_audio_processing_wrapper");
 
-    let binding_file = out_dir().join("bindings.rs");
+    // --- Start of Corrected bindgen Code ---
     let mut builder = bindgen::Builder::default()
         .header("src/wrapper.hpp")
-        .clang_args(&["-x", "c++", "-std=c++17", "-fparse-all-comments"])
-        .generate_comments(true)
+        .clang_args(&["-x", "c++", "-std=c++17"])
         .enable_cxx_namespaces()
-        .allowlist_type("webrtc::AudioProcessing_Error")
-        .allowlist_type("webrtc::AudioProcessing_Config")
-        .allowlist_type("webrtc::AudioProcessing_RealtimeSetting")
-        .allowlist_type("webrtc::StreamConfig")
-        .allowlist_type("webrtc::ProcessingConfig")
         .allowlist_function("webrtc_audio_processing_wrapper::.*")
-        // The functions returns std::string, and is not FFI-safe.
-        .blocklist_item("webrtc::AudioProcessing_Config_ToString")
-        .opaque_type("std::.*")
-        .derive_debug(true)
-        .derive_default(true);
-    for dir in &include_dirs {
-        builder = builder.clang_arg(&format!("-I{}", dir.display()));
+        .allowlist_type("webrtc::AudioProcessing.*") // Allowlist APM and its sub-structs
+        .opaque_type("std::.*") // Treat std:: types as opaque
+        .opaque_type("absl::.*") // Treat absl:: types as opaque. This is the fix.
+        .derive_default(true)
+        .derive_debug(true);
+    // --- End of Corrected bindgen Code ---
+
+    if target_os == "android" {
+        let android_ndk_home = env::var("ANDROID_NDK_HOME").unwrap();
+        let toolchains_path =
+            PathBuf::from(&android_ndk_home).join("toolchains/llvm/prebuilt/linux-x86_64");
+        let sysroot = toolchains_path.join("sysroot");
+
+        let target = env::var("TARGET").unwrap();
+        let api_level = "21";
+        let full_target = format!("{}{}", target, api_level);
+
+        builder = builder
+            .clang_arg(format!("--sysroot={}", sysroot.to_str().unwrap()))
+            .clang_arg(format!("--target={}", full_target));
     }
+
+    for dir in &include_dirs {
+        builder = builder.clang_arg(&format!("-I{}", dir.to_str().unwrap()));
+    }
+
     builder
         .generate()
-        .expect("Unable to generate bindings")
-        .write_to_file(&binding_file)
-        .expect("Couldn't write bindings!");
+        .context("Unable to generate bindings")?
+        .write_to_file(out_dir.join("bindings.rs"))
+        .context("Couldn't write bindings!")?;
 
     Ok(())
 }

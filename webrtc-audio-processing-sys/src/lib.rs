@@ -6,7 +6,10 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-pub use root::{webrtc::*, webrtc_audio_processing_wrapper::*};
+pub use root::{
+    webrtc::*,
+    webrtc_audio_processing_wrapper::{AudioProcessing, *},
+};
 
 impl From<OptionalInt> for Option<i32> {
     fn from(other: OptionalInt) -> Option<i32> {

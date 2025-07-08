@@ -58,6 +58,16 @@ pub struct Processor {
     deinterleaved_render_frame: Vec<Vec<f32>>,
 }
 
+impl std::fmt::Debug for Processor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Processor")
+            .field("inner", &self.inner.inner)
+            .field("deinterleaved_capture_frame", &self.deinterleaved_capture_frame.len())
+            .field("deinterleaved_render_frame", &self.deinterleaved_render_frame.len())
+            .finish()
+    }
+}
+
 impl Processor {
     /// Creates a new `Processor`. `InitializationConfig` is only used on
     /// instantiation, however new configs can be be passed to `set_config()`
